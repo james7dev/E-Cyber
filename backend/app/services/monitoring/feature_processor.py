@@ -200,7 +200,7 @@ class AdvancedFeatureExtractor:
         st = self.flows[flow_key]
         f = {}
 
-        f["Flow_Duration"] = (st.last_seen - st.start_time) * 1e6  # Convert to microseconds
+        f["Flow_Duration"] = st.duration * 1e6  # Convert to microseconds
         f["Total_Fwd_Packets"] = st.forward_packets
         f["Total_Backward_Packets"] = st.backward_packets
         f["Total_Length_of_Fwd_Packets"] = st.total_length_forward
@@ -344,21 +344,20 @@ class AdvancedFeatureExtractor:
         if not flow_key:
             return None
 
+        now = packet_info['timestamp'] # Current packet's timestamp
+
         if flow_key not in self.flows:
-            self.flows[flow_key] = FlowStatistics()
+            self.flows[flow_key] = FlowStatistics(start_time=now, last_seen=now, last_activity=now)
             self.flow_packets[flow_key] = []
             st = self.flows[flow_key]
-            st.start_time = packet_info['timestamp']
-            st.last_seen = packet_info['timestamp']
-            st.last_activity = packet_info['timestamp']
-        else: 
+        else:
             st = self.flows[flow_key]
+            st.start_time = min(st.start_time, now)
+            st.last_seen = max(st.last_seen, now)
+            # last_activity will be updated later
 
-        now = packet_info['timestamp']
-
-        # Update timing
-        st.last_seen = now
-        st.duration = now - st.start_time
+        # Update duration
+        st.duration = max(0, st.last_seen - st.start_time)
 
         # Store packet
         st.packets.append(packet)
@@ -513,12 +512,20 @@ class AdvancedFeatureExtractor:
                     return {}
 
                 # Get or create flow statistics
-                if flow_key not in self.flows:
-                    self.flows[flow_key] = FlowStatistics()
-                    self.flow_packets[flow_key] = []
+                now = packet.time # Current packet's timestamp
 
-                flow_stats = self.flows[flow_key]
-                now = packet.time
+                if flow_key not in self.flows:
+                    self.flows[flow_key] = FlowStatistics(start_time=now, last_seen=now, last_activity=now)
+                    self.flow_packets[flow_key] = []
+                    flow_stats = self.flows[flow_key]
+                else:
+                    flow_stats = self.flows[flow_key]
+                    # Ensure start_time is the minimum and last_seen is the maximum
+                    flow_stats.start_time = min(flow_stats.start_time, now)
+                    flow_stats.last_seen = max(flow_stats.last_seen, now)
+        
+                # Update duration consistently
+                flow_stats.duration = max(0, flow_stats.last_seen - flow_stats.start_time)
 
                 # Append packet
                 self.flow_packets[flow_key].append(packet)
@@ -530,8 +537,8 @@ class AdvancedFeatureExtractor:
                 header_len = packet_info.get("header_length", 0)
 
                 flow_stats.total_packets += 1
-                flow_stats.duration = now - flow_stats.start_time
-                flow_stats.last_seen = now
+                # flow_stats.duration = now - flow_stats.start_time # This was the old line
+                # flow_stats.last_seen = now # This is already set prior to duration calculation
 
                 if direction == "forward":
                     flow_stats.forward_packets += 1
@@ -785,17 +792,22 @@ class AdvancedFeatureExtractor:
             packet_metrics.timestamp if packet_metrics.timestamp else time.time()
         )
 
-        # Update basic flow info
-        if flow_stats.total_packets == 0:
+        # current_time is packet_metrics.timestamp
+
+        if flow_stats.total_packets == 0: # This implies it's the first packet metric being processed for this flow_stats object
             flow_stats.start_time = current_time
             flow_stats.last_forward_time = current_time
             flow_stats.last_backward_time = current_time
             flow_stats.last_flow_time = current_time
             flow_stats.last_activity = current_time
             flow_stats.last_seen = current_time
+        else:
+            # Ensure start_time is the minimum and last_seen is the maximum
+            flow_stats.start_time = min(flow_stats.start_time, current_time)
+            flow_stats.last_seen = max(flow_stats.last_seen, current_time)
 
-        flow_stats.last_seen = current_time
-        flow_stats.duration = current_time - flow_stats.start_time
+        flow_stats.duration = max(0, flow_stats.last_seen - flow_stats.start_time)
+        # flow_stats.total_packets will be incremented after this block, so increment it here.
         flow_stats.total_packets += 1
 
         # Determine flow direction
@@ -806,11 +818,15 @@ class AdvancedFeatureExtractor:
 
         if is_forward:
             if flow_stats.last_forward_time is not None:
+                if current_time < flow_stats.last_forward_time:
+                    logger.warning(f"Timestamp anomaly: current_time ({current_time}) < last_forward_time ({flow_stats.last_forward_time}) for flow {flow_key}")
                 iat_forward = max(0, current_time - flow_stats.last_forward_time)
                 flow_stats.forward_iat.append(iat_forward)
             flow_stats.last_forward_time = current_time
         else:
             if flow_stats.last_backward_time is not None:
+                if current_time < flow_stats.last_backward_time:
+                    logger.warning(f"Timestamp anomaly: current_time ({current_time}) < last_backward_time ({flow_stats.last_backward_time}) for flow {flow_key}")
                 iat_backward = max(0, current_time - flow_stats.last_backward_time)
                 flow_stats.backward_iat.append(iat_backward)
             flow_stats.last_backward_time = current_time
@@ -853,6 +869,8 @@ class AdvancedFeatureExtractor:
         #     flow_stats.flow_iat.append(current_time - flow_packets[-1].time)
 
         if flow_stats.last_flow_time is not None:
+            if current_time < flow_stats.last_flow_time:
+                logger.warning(f"Timestamp anomaly: current_time ({current_time}) < last_flow_time ({flow_stats.last_flow_time}) for flow {flow_key}")
             iat_flow = max(0, current_time - flow_stats.last_flow_time)
             flow_stats.flow_iat.append(iat_flow)
         flow_stats.last_flow_time = current_time
@@ -871,25 +889,41 @@ class AdvancedFeatureExtractor:
 
         # Update inter-arrival times
         if len(flow_packets) > 0:
-            iat = current_time - flow_packets[-1].time
+            # General flow IAT
+            if current_time < flow_packets[-1].timestamp:
+                logger.warning(f"Timestamp anomaly (flow_packets general): current_time ({current_time}) < prev_packet_timestamp ({flow_packets[-1].timestamp}) for flow {flow_key}")
+            iat = max(0, current_time - flow_packets[-1].timestamp)
             flow_stats.flow_iat.append(iat)
 
             if is_forward:
                 # Find last forward packet
-                for idx, pkt in enumerate(reversed(flow_packets)):
-                    if (
-                        idx % 2 == 0
-                    ) == is_forward:  # Use index from reversed iteration
-                        forward_iat = current_time - pkt.time
+                # Iterate in reverse to find the most recent packet in the same direction
+                for pkt_metric in reversed(flow_packets[:-1]): # Exclude current packet
+                    # Determine direction of pkt_metric based on its relation to flow_key
+                    pkt_metric_is_forward = (
+                        pkt_metric.pkt[IP].src == flow_key.src_ip and
+                        pkt_metric.pkt[TCP].sport == flow_key.src_port
+                    ) if pkt_metric.pkt.haslayer(IP) and pkt_metric.pkt.haslayer(TCP) else False # Default if not IP/TCP
+
+                    if pkt_metric_is_forward:
+                        if current_time < pkt_metric.timestamp:
+                            logger.warning(f"Timestamp anomaly (flow_packets forward): current_time ({current_time}) < pkt_metric.timestamp ({pkt_metric.timestamp}) for flow {flow_key}")
+                        forward_iat = max(0, current_time - pkt_metric.timestamp)
                         flow_stats.forward_iat.append(forward_iat)
                         break
-            else:
+            else: # Backward packet
                 # Find last backward packet
-                for pkt in reversed(flow_packets):
-                    if (
-                        flow_packets.index(pkt) % 2 == 0
-                    ) != is_forward:  # Same direction
-                        backward_iat = current_time - pkt.time
+                # Iterate in reverse to find the most recent packet in the same direction
+                for pkt_metric in reversed(flow_packets[:-1]): # Exclude current packet
+                    pkt_metric_is_forward = (
+                        pkt_metric.pkt[IP].src == flow_key.src_ip and
+                        pkt_metric.pkt[TCP].sport == flow_key.src_port
+                    ) if pkt_metric.pkt.haslayer(IP) and pkt_metric.pkt.haslayer(TCP) else False # Default if not IP/TCP
+
+                    if not pkt_metric_is_forward: # If this packet in flow_packets was backward
+                        if current_time < pkt_metric.timestamp:
+                            logger.warning(f"Timestamp anomaly (flow_packets backward): current_time ({current_time}) < pkt_metric.timestamp ({pkt_metric.timestamp}) for flow {flow_key}")
+                        backward_iat = max(0, current_time - pkt_metric.timestamp)
                         flow_stats.backward_iat.append(backward_iat)
                         break
 
