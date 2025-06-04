@@ -104,55 +104,107 @@ class ThreatIntelligenceService:
             response.raise_for_status()  # Raise an exception for HTTP errors
             data = response.json()
 
-            # Structure the data (example: take first 50 indicators for brevity)
-            # In a real scenario, you might want to process all of them or filter
+            # --- Start Debugging Additions ---
+            logger.info(f"OSINT feed: Type of raw 'data' from response.json(): {type(data)}")
+            if isinstance(data, list):
+                logger.info(f"OSINT feed: 'data' is a list. Length: {len(data)}")
+                if len(data) > 0:
+                    logger.info(f"OSINT feed: Type of first element in 'data': {type(data[0])}")
+            elif isinstance(data, dict):
+                logger.info(f"OSINT feed: 'data' is a dict. Keys: {list(data.keys())}")
+            else:
+                logger.info(f"OSINT feed: 'data' is neither a list nor a dict. It is: {str(data)[:200]}") # Log first 200 chars
+
+            test_slice = None
+            try:
+                test_slice = data[:50] # Attempt slice
+                logger.info(f"OSINT feed: Type of 'test_slice' (data[:50]): {type(test_slice)}")
+                if isinstance(test_slice, list):
+                    logger.info(f"OSINT feed: 'test_slice' is a list. Length: {len(test_slice)}")
+                    if len(test_slice) > 0:
+                         logger.info(f"OSINT feed: Type of first element in 'test_slice': {type(test_slice[0])}")
+                else:
+                    logger.info(f"OSINT feed: 'test_slice' is not a list. It is: {str(test_slice)[:200]}")
+
+            except TypeError as slice_err:
+                logger.error(f"OSINT feed: Error when trying to slice 'data': {slice_err}", exc_info=True)
+                # If slicing fails, we can't proceed with the loop as it was.
+                # Return error, or an empty list if appropriate.
+                self.cache["osint_feed"] = { "error": f"Slicing error: {slice_err}", "last_updated": datetime.utcnow().isoformat(), "source_url": url, "name": "ThreatFox IOCs", "id": "threatfox", "data": [] }
+                self._save_cache(self.cache)
+                return {"error": f"Slicing error: {slice_err}", "status": "error", "data": []}
+            # --- End Debugging Additions ---
+
+
+            # Original logger info line, now after debug logs
+            logger.info(f"OSINT feed: Received {len(data) if isinstance(data, list) else 'N/A'} items from API. Processing up to 50.")
+
             structured_data = []
-            logger.info(f"OSINT feed: Received {len(data)} items from API. Processing up to 50.") # Log total items received
             processed_item_count = 0
-            for item_index, item in enumerate(data[:50]): # Iterate with index for better logging
-                if processed_item_count >= 50: # Ensure we don't process more than 50
-                    break
-                try:
-                    # logger.debug(f"Processing OSINT item {item_index}: {item}") # Potentially very verbose
 
-                    tags_data = item.get("tags")
-                    if isinstance(tags_data, list):
-                        # Ensure all tags are strings and filter out any non-string tags if necessary
-                        processed_tags = [str(tag) for tag in tags_data if isinstance(tag, (str, int, float, bool))]
-                    elif tags_data is not None: # If tags_data is not a list but exists, log and make empty
-                        logger.warning(f"OSINT item {item_index} 'tags' field was not a list, got {type(tags_data)}. Item: {item}")
-                        processed_tags = []
-                    else: # tags_data is None
-                        processed_tags = []
+            # Temporarily simplified loop for debugging the "unhashable type: 'slice'" error
+            # The goal is to see if the error happens during iteration setup or first item access
+            if isinstance(test_slice, list): # Use the test_slice we already made and type-checked
+                logger.info(f"OSINT feed: Starting simplified debug loop with 'test_slice' of length {len(test_slice)}.")
+                for item_index, item in enumerate(test_slice):
+                    try:
+                        logger.info(f"OSINT feed (Debug Loop): Processing item {item_index}, type: {type(item)}")
+                        if isinstance(item, dict):
+                            # Perform a very simple operation, like trying to get a known key
+                            # This is to check if 'item' itself is problematic or if its contents are.
+                            # Example: just logging keys to see their types.
+                            # for k_debug, v_debug in item.items():
+                            #    logger.debug(f"Item {item_index} key: {k_debug} (type {type(k_debug)})")
 
-                    indicator_data = {
-                        "ioc_id": str(item.get("ioc_id")) if item.get("ioc_id") is not None else None,
-                        "indicator": str(item.get("ioc_value")) if item.get("ioc_value") is not None else None,
-                        "type": str(item.get("ioc_type")) if item.get("ioc_type") is not None else None,
-                        "threat_type": str(item.get("threat_type_desc")) if item.get("threat_type_desc") is not None else None,
-                        "malware": str(item.get("malware_printable")) if item.get("malware_printable") is not None else None,
-                        "source": "ThreatFox", # This is a fixed string
-                        "first_seen": str(item.get("first_seen_utc")) if item.get("first_seen_utc") is not None else None,
-                        "last_seen": str(item.get("last_seen_utc")) if item.get("last_seen_utc") is not None else None,
-                        "confidence": item.get("confidence_level"), # Typically an int
-                        "reference": str(item.get("reference")) if item.get("reference") is not None else None,
-                        "tags": processed_tags,
-                    }
-                    structured_data.append(indicator_data)
-                    processed_item_count += 1
-                except Exception as item_exc:
-                    logger.error(f"OSINT feed: Error processing item at index {item_index}. Error: {item_exc}. Item: {item}", exc_info=True)
-                    # Optionally, continue to process next items or break
-                    continue # Skip this item and continue with the next
+                            # The following is the original processing logic, now inside this debug try-except
+                            tags_data = item.get("tags")
+                            if isinstance(tags_data, list):
+                                processed_tags = [str(tag) for tag in tags_data if isinstance(tag, (str, int, float, bool))]
+                            elif tags_data is not None:
+                                logger.warning(f"OSINT item {item_index} 'tags' field was not a list, got {type(tags_data)}. Item: {str(item)[:200]}")
+                                processed_tags = []
+                            else:
+                                processed_tags = []
+
+                            indicator_data = {
+                                "ioc_id": str(item.get("ioc_id")) if item.get("ioc_id") is not None else None,
+                                "indicator": str(item.get("ioc_value")) if item.get("ioc_value") is not None else None,
+                                "type": str(item.get("ioc_type")) if item.get("ioc_type") is not None else None,
+                                "threat_type": str(item.get("threat_type_desc")) if item.get("threat_type_desc") is not None else None,
+                                "malware": str(item.get("malware_printable")) if item.get("malware_printable") is not None else None,
+                                "source": "ThreatFox",
+                                "first_seen": str(item.get("first_seen_utc")) if item.get("first_seen_utc") is not None else None,
+                                "last_seen": str(item.get("last_seen_utc")) if item.get("last_seen_utc") is not None else None,
+                                "confidence": item.get("confidence_level"),
+                                "reference": str(item.get("reference")) if item.get("reference") is not None else None,
+                                "tags": processed_tags,
+                            }
+                            structured_data.append(indicator_data) # Add to the original structured_data
+                            processed_item_count += 1
+                        else:
+                            logger.warning(f"OSINT feed (Debug Loop): Item {item_index} is not a dict, it is {type(item)}. Skipping.")
+
+                        # For debugging, let's try to process only a few items to see if error occurs early
+                        # if item_index >= 4 : # Process first 5 items then break
+                        #    logger.info("OSINT feed (Debug Loop): Processed 5 items, breaking for debug.")
+                        #    break
+
+                    except Exception as item_processing_exc:
+                        logger.error(f"OSINT feed (Debug Loop): Error processing item {item_index}. Error: {item_processing_exc}. Item: {str(item)[:500]}", exc_info=True) # Log more of the item
+                        # Continue to the next item to see if others succeed
+                        continue
+                logger.info("OSINT feed (Debug Loop): Finished simplified loop.")
+            else:
+                logger.error("OSINT feed: 'test_slice' was not a list, cannot perform loop processing.")
+                # This case should have been caught by the slice_err block earlier if data[:50] failed.
+                # If it's not a list here, it means data[:50] returned something other than a list but didn't raise TypeError.
 
             if not structured_data:
                 logger.warning("OSINT feed: No structured data was generated after processing items. This might be due to an empty API response or all items failing processing. Cache will not be updated with empty data.")
-                # Potentially update cache with error if all items failed and it was an empty response initially.
-                # For now, if response had data but all items failed, this is fine.
                 return {"status": "error", "reason": "no data processed or all items failed", "data": []}
 
             self.cache["osint_feed"] = {
-                "data": structured_data,
+                "data": structured_data, # Use the data populated by the loop
                 "last_updated": datetime.utcnow().isoformat(),
                 "source_url": url,
                 "name": "ThreatFox IOCs",  # Added for consistency
@@ -166,14 +218,13 @@ class ThreatIntelligenceService:
         except requests.RequestException as e:
             status_code = e.response.status_code if e.response is not None else "N/A"
             logger.error(f"Error fetching OSINT feed from {url}. Status code: {status_code}. Error: {e}")
-            # Save error information to cache, so we know it failed
             self.cache["osint_feed"] = {
                 "error": str(e),
                 "last_updated": datetime.utcnow().isoformat(),
                 "source_url": url,
                 "name": "ThreatFox IOCs",
                 "id": "threatfox",
-                "data": [] # Ensure data is empty on error
+                "data": []
             }
             self._save_cache(self.cache)
             return {"error": str(e), "status": "error", "data": []}
@@ -189,8 +240,19 @@ class ThreatIntelligenceService:
             }
             self._save_cache(self.cache)
             return {"error": "JSON parsing error", "status": "error", "data": []}
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while fetching OSINT feed: {e}")
+        except Exception as e: # This is the generic catch-all
+            logger.error(f"An unexpected error occurred while fetching OSINT feed: {e}", exc_info=True) # Added exc_info=True
+            # Try to save minimal error info to cache if possible
+            if hasattr(self, 'cache') and isinstance(self.cache, dict): # Check if cache exists and is a dict
+                 self.cache["osint_feed"] = {
+                    "error": f"Unexpected error: {e}",
+                    "last_updated": datetime.utcnow().isoformat(),
+                    "source_url": url,
+                    "name": "ThreatFox IOCs",
+                    "id": "threatfox",
+                    "data": []
+                }
+                 self._save_cache(self.cache)
             return {"error": str(e), "status": "error", "data": []}
 
     def fetch_cve_data(self):
