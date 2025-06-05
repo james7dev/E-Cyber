@@ -53,6 +53,9 @@ SyncSessionLocal = sessionmaker(
 async def init_db():
     """Initialize database tables in correct order"""
     async with engine.begin() as conn:
+        # Drop all tables first (optional, for development)
+        await conn.run_sync(Base.metadata.drop_all, checkfirst=True) # Add this line
+
         # First pass: Create tables without foreign key dependencies
         await conn.run_sync(Base.metadata.create_all, tables=[
             User.__table__,
