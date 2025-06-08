@@ -2288,70 +2288,83 @@ class MemoryMonitor:
 
 
 class EnterpriseIPS:
-
     def __init__(
         self,
         rule_file: str,
         sio: socketio.AsyncServer,
-        threat_intel: ThreatIntel = None,
+        threat_intel: Optional[ThreatIntel] = None, # Added Optional
         num_workers: int = multiprocessing.cpu_count(),
-        input_queue: Queue = None,
-        output_queue: Queue = None,
+        input_queue: Optional[Queue] = None, # Added Optional
+        output_queue: Optional[Queue] = None, # Added Optional
+        ips_config: Optional[Dict[str, Any]] = None # Added ips_config
     ):
         self.rule_file = rule_file
         self.sio = sio
         self.num_workers = num_workers
-        self.input_queue = input_queue # Should be self.input_queue = input_queue or multiprocessing.Queue()
-        self.threat_intel = threat_intel # Should be self.threat_intel = threat_intel or await ThreatIntel.create()
+        self.config = ips_config if ips_config is not None else {} # Define self.config early
 
-        # Initialize RuleManager in EnterpriseIPS to load rules once
-        self.main_rule_manager = RuleManager(self.rule_file, config={"match_ttl": 60}) # Assuming config is relevant for main manager
-        self.processed_rules = self.main_rule_manager.rules # Get the list of processed rules
+        self.threat_intel = threat_intel
+        if self.threat_intel is None:
+            # In a production scenario, ThreatIntel might be critical.
+            # Consider if self.threat_intel = ThreatIntel() or similar default makes sense,
+            # or if it must be provided. For now, just a warning.
+            logger.warning("ThreatIntel instance not provided to EnterpriseIPS. Some features might be limited.")
 
-        if self.input_queue is None: # Example initialization if not passed
+        # MAX_PACKET_QUEUE_SIZE is a global constant in this file, so direct use is fine.
+        # No need for: if not 'MAX_PACKET_QUEUE_SIZE' in globals(): MAX_PACKET_QUEUE_SIZE = 10000
+
+        # Use self.config for rule_manager_config
+        self.main_rule_manager = RuleManager(self.rule_file, config=self.config.get("rule_manager_config", {}))
+        self.processed_rules = self.main_rule_manager.rules
+
+        if input_queue is None:
             self.input_queue = multiprocessing.Queue(maxsize=MAX_PACKET_QUEUE_SIZE)
         else:
-            # Ensure maxsize is set if queue is passed externally.
-            # This might be tricky as Queue objects don't expose maxsize easily after creation.
-            # For now, assume it's handled or document that passed queues should be pre-configured.
-            pass
+            self.input_queue = input_queue # Assume pre-configured if passed
 
         self.output_queue = output_queue if output_queue is not None else multiprocessing.Queue()
-        self.workers = []
+
+        self.workers = [] # Should be List[IPSWorker] if type hinting
         self.stats_collector = StatsCollector()
         self.memory_monitor = MemoryMonitor()
-        mitigation_config = {
+
+        mitigation_engine_config = {
+            # Global settings (from settings object)
             "firewall_api": settings.FIREWALL_API_URL,
             "firewall_api_key": settings.FIREWALL_API_KEY,
-            "threat_intel_api": settings.THREAT_INTEL_API_URL,
-            "nac_api": settings.NAC_API_URL, # Corrected typo in original code (local127.0.0.1)
+            "threat_intel_api": settings.THREAT_INTEL_API_URL, # This is for MitigationEngine's _update_threat_intel
+            "nac_api": settings.NAC_API_URL,
             "dns_controller_api": settings.DNS_CONTROLLER_API_URL,
             "dns_controller_key": settings.DNS_CONTROLLER_API_KEY,
-            "geoip_service_url_template": self.config.get("geoip_service_url_template"), # Keep existing way if not in global settings
-            "geoip_service_params": self.config.get("geoip_service_params", {}), # Keep existing way
-            "network_controller_api": self.config.get("network_controller_api"), # Keep existing way
-            "network_controller_key": self.config.get("network_controller_key"), # Keep existing way
-            "network_controller_type": self.config.get("network_controller_type"), # Keep existing way
-            "nac_quarantine_policy": self.config.get("nac_quarantine_policy"), # Keep existing way
-            "dns_sinkhole_ip": self.config.get("dns_sinkhole_ip"), # Keep existing way
-            "cleanup_on_exit": self.config.get("cleanup_on_exit", False), # Keep existing way
-            "default_api_timeout": self.config.get("default_api_timeout", 10), # Keep existing way
+
+            # Instance-specific settings (from self.config) with fallbacks to global settings or defaults
+            "geoip_service_url_template": self.config.get("geoip_service_url_template", settings.GEOIP_SERVICE_URL_TEMPLATE),
+            "geoip_service_params": self.config.get("geoip_service_params", {}), # Default to empty dict if not in self.config
+            "network_controller_api": self.config.get("network_controller_api"), # No global default, so None if not in self.config
+            "network_controller_key": self.config.get("network_controller_key"),
+            "network_controller_type": self.config.get("network_controller_type"),
+            "nac_quarantine_policy": self.config.get("nac_quarantine_policy"),
+            "dns_sinkhole_ip": self.config.get("dns_sinkhole_ip"),
+            "cleanup_on_exit": self.config.get("cleanup_on_exit", False),
+            # For default_api_timeout, prefer instance config, then global, then hardcoded default
+            "default_api_timeout": self.config.get("default_api_timeout", getattr(settings, 'DEFAULT_API_TIMEOUT', 10)),
 
             "dashboard_config": {
                 "base_url": settings.DASHBOARD_API_URL,
                 "api_key": settings.DASHBOARD_API_KEY,
-                "max_retries": settings.DASHBOARD_MAX_RETRIES,
+                "max_retries": settings.DASHBOARD_MAX_RETRIES, # Assuming these were added to global settings
                 "retry_delay": settings.DASHBOARD_RETRY_DELAY,
                 "timeout": settings.DASHBOARD_TIMEOUT,
             },
         }
+
         self.mitigation_engine = MitigationEngine(
-            sio=sio,
-            threat_intel=self.threat_intel,
-            config=mitigation_config,
+            sio=sio, # Pass the sio instance
+            threat_intel=self.threat_intel, # Pass the threat_intel instance
+            config=mitigation_engine_config,
         )
-        self.shutdown_flag = asyncio.Event()
-        self.background_tasks = set()
+        self.shutdown_flag = asyncio.Event() # For coordinating async shutdown
+        self.background_tasks: Set[asyncio.Task] = set() # For managing background async tasks
 
     async def start(self):
         """Start the IPS system"""
