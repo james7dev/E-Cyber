@@ -1,9 +1,12 @@
 import logging
 import json
 import requests
+import asyncio # Import asyncio
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
+from ....core.config import settings # Import settings
+
+# logging.basicConfig(level=logging.INFO) # This line will be removed
 logger = logging.getLogger(__name__)
 
 
@@ -19,19 +22,9 @@ class ThreatIntelligenceService:
         # Check if either feed is missing or its data is empty or seems like placeholder (e.g., list of nulls for CVEs)
         needs_osint_load = not osint_feed_data
         # For CVE, check if data is present and if the first item has an ID (assuming valid items always have IDs)
-        needs_cve_load = not cve_feed_data or (
-            isinstance(cve_feed_data, list)
-            and cve_feed_data
-            and cve_feed_data[0].get("id") is None
-        )
-
-        if needs_osint_load or needs_cve_load:
-            logger.info(
-                "Performing initial data load due to missing or invalid feed data in cache."
-            )
-            self.initial_data_load(
-                force_osint=needs_osint_load, force_cve=needs_cve_load
-            )
+        # The actual data loading will be triggered by the async dependency provider now.
+        # __init__ should remain lightweight and synchronous.
+        pass
 
     def _initialize_feed_metadata(self):
         """Initializes metadata like subscription status for feeds if not already present."""
@@ -80,41 +73,57 @@ class ThreatIntelligenceService:
         except IOError as e:
             logger.error(f"Error saving cache to {self.cache_file_path}: {e}")
 
-    def initial_data_load(self, force_osint=True, force_cve=True):
-        logger.info(
-            f"Performing initial data load. Force OSINT: {force_osint}, Force CVE: {force_cve}"
+    async def initial_data_load(self): # Changed to async def
+        # Determine if data loading is necessary based on cache state
+        osint_feed_data = self.cache.get("osint_feed", {}).get("data")
+        cve_feed_data = self.cache.get("cve_feed", {}).get("data")
+        needs_osint_load = not osint_feed_data
+        needs_cve_load = not cve_feed_data or (
+            isinstance(cve_feed_data, list)
+            and cve_feed_data
+            and cve_feed_data[0].get("id") is None
         )
-        if force_osint:
+
+        if not needs_osint_load and not needs_cve_load:
+            logger.info("Initial data load not required, cache seems populated.")
+            return
+
+        logger.info(
+            f"Performing initial data load. OSINT needed: {needs_osint_load}, CVE needed: {needs_cve_load}"
+        )
+
+        if needs_osint_load:
             if self.cache.get("threatfox_meta", {}).get("is_subscribed", True):
-                self.fetch_osint_feed()
+                await self.fetch_osint_feed()
             else:
                 logger.info("Skipping OSINT feed load as it's not subscribed.")
         else:
             logger.info(
-                "OSINT feed data seems valid in cache, skipping initial load unless forced."
+                "OSINT feed data seems valid in cache, skipping initial load."
             )
 
-        if force_cve:
+        if needs_cve_load:
             if self.cache.get("cve_circl_meta", {}).get("is_subscribed", True):
-                self.fetch_cve_data()
+                await self.fetch_cve_data()
             else:
                 logger.info("Skipping CVE feed load as it's not subscribed.")
         else:
             logger.info(
-                "CVE feed data seems valid in cache, skipping initial load unless forced."
+                "CVE feed data seems valid in cache, skipping initial load."
             )
         logger.info("Initial data load process complete.")
 
-    def fetch_osint_feed(self):
+    async def fetch_osint_feed(self):
         # Ensure that we only fetch if subscribed
         if not self.cache.get("threatfox_meta", {}).get("is_subscribed", True):
             logger.info("ThreatFox feed is unsubscribed. Skipping fetch.")
             return {"status": "skipped", "reason": "unsubscribed", "data": []}
 
         logger.info("Fetching OSINT feed from ThreatFox...")
-        url = "https://threatfox.abuse.ch/export/json/recent/"
+        url = settings.THREATFOX_URL
         try:
-            response = requests.get(url, timeout=10)
+            # Wrap synchronous requests.get in asyncio.to_thread
+            response = await asyncio.to_thread(requests.get, url, timeout=10)
             response.raise_for_status()  # Raise an exception for HTTP errors
             data = response.json()
 
@@ -385,9 +394,10 @@ class ThreatIntelligenceService:
             return {"status": "skipped", "reason": "unsubscribed", "data": []}
 
         logger.info("Fetching CVE data from cve.circl.lu...")
-        url = "https://cve.circl.lu/api/last/10"
+        url = settings.CIRCL_CVE_URL
         try:
-            response = requests.get(url, timeout=10)
+            # Wrap synchronous requests.get in asyncio.to_thread
+            response = await asyncio.to_thread(requests.get, url, timeout=10)
             response.raise_for_status()
             data = response.json()
 

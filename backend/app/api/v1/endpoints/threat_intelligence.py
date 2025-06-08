@@ -1,19 +1,34 @@
 from fastapi import APIRouter, HTTPException, Depends
 from ....services.threat_intelligence_service import ThreatIntelligenceService
+from ....models.user import User # Import User model
+from ....core.security import get_current_active_user # Import auth dependency
 from pydantic import BaseModel
 from typing import List, Optional, Any
 
 router = APIRouter()
 
 # Dependency provider for ThreatIntelligenceService
-_threat_intel_service_instance = None
+_threat_intel_service_instance: Optional[ThreatIntelligenceService] = None
+_threat_intel_service_initialized: bool = False
 
-def get_threat_intel_service():
-    global _threat_intel_service_instance
+async def get_threat_intel_service() -> ThreatIntelligenceService: # Changed to async def
+    nonlocal _threat_intel_service_instance, _threat_intel_service_initialized
+
     if _threat_intel_service_instance is None:
-        # This will use the default cache_file_path="threat_data_cache.json"
-        # or any other default configured in the service's __init__
-        _threat_intel_service_instance = ThreatIntelligenceService()
+        _threat_intel_service_instance = ThreatIntelligenceService() # Synchronous instantiation
+
+    if not _threat_intel_service_initialized:
+        if _threat_intel_service_instance: # Should always be true here
+            await _threat_intel_service_instance.initial_data_load()
+            _threat_intel_service_initialized = True
+        else:
+            # This case should ideally not be reached if instance is created above.
+            # Handling for robustness, though it might indicate a logic error if ever hit.
+            raise HTTPException(status_code=500, detail="Threat intelligence service not available.")
+
+    if _threat_intel_service_instance is None: # Defensive check, should not happen
+        raise HTTPException(status_code=500, detail="Threat intelligence service failed to initialize.")
+
     return _threat_intel_service_instance
 
 # Pydantic Models for API responses
@@ -83,6 +98,7 @@ async def subscribe_to_feed_endpoint(
     feed_id: str,
     subscription_request: SubscriptionRequest,
     service: ThreatIntelligenceService = Depends(get_threat_intel_service),
+    current_user: User = Depends(get_current_active_user)
 ):
     try:
         # The service method now returns the updated feed status or an error dict
@@ -106,7 +122,9 @@ async def subscribe_to_feed_endpoint(
 
 @router.post("/feeds/{feed_id}/refresh", response_model=RefreshResponse)
 async def refresh_feed_endpoint(
-    feed_id: str, service: ThreatIntelligenceService = Depends(get_threat_intel_service)
+    feed_id: str,
+    service: ThreatIntelligenceService = Depends(get_threat_intel_service),
+    current_user: User = Depends(get_current_active_user)
 ):
     try:
         result = service.refresh_feed_data(feed_id)

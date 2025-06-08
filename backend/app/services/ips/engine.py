@@ -36,6 +36,8 @@ from functools import partial, lru_cache
 import zlib
 import heapq
 
+from ....core.config import settings # Import the global settings
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enterprise_ips")
@@ -138,7 +140,8 @@ class ThreatIntel:
             for attempt in range(3):
                 try:
                     async with aiohttp.ClientSession(headers=headers) as session:
-                        async with session.get(firehol_url) as resp:
+                        # Add timeout to individual session.get() call
+                        async with session.get(firehol_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                             resp.raise_for_status()
                             text = await resp.text()
                             firehol_ips = text.splitlines()
@@ -160,7 +163,8 @@ class ThreatIntel:
             for attempt in range(3):
                 try:
                     async with aiohttp.ClientSession(headers=headers) as session:
-                        async with session.get(tor_url) as resp:
+                        # Add timeout to individual session.get() call
+                        async with session.get(tor_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                             resp.raise_for_status()
                             text = await resp.text()
                             tor_exit_ips = [
@@ -313,12 +317,22 @@ class RuleManager:
                 self.rules = rules_data
                 self.rule_hash = current_hash
                 self.last_loaded = datetime.now()
-                ids = [rule["id"] for rule in rules_data]
+
+                # Pre-compile regex patterns
+                for rule in self.rules:
+                    if 'pattern' in rule and isinstance(rule['pattern'], str) and not rule['pattern'].startswith('\\x'):
+                        try:
+                            rule['compiled_pattern'] = re.compile(rule['pattern'], re.IGNORECASE)
+                        except re.error as e:
+                            logger.error(f"Failed to compile regex for rule ID {rule.get('id', 'N/A')} pattern '{rule['pattern']}': {e}")
+                            rule['compiled_pattern'] = None # Mark as failed
+
+                ids = [rule["id"] for rule in self.rules] # Ensure self.rules is used here after modification
                 if len(set(ids)) != len(ids):
                     raise ValueError("Duplicate rule IDs found!")
 
                 # logger.info(f"Loaded {len(self.rules)} rules from {self.rule_file}")
-                self.validate_rules()
+                self.validate_rules() # validate_rules might need to be aware of 'compiled_pattern' if it checks all keys
                 return True
         except Exception as e:
             logger.error(f"Failed to load rules: {e}")
@@ -392,7 +406,8 @@ class RateLimiter:
 
 class PacketProcessor:
     def __init__(self, rule_manager: RuleManager, threat_intel: ThreatIntel):
-        self.rule_manager = rule_manager
+        # self.rule_manager = rule_manager # RuleManager instance no longer passed
+        self.rules = rules # Store the list of rules directly
         self.threat_intel = threat_intel
         self.sequence_tracker = {}
         self.rate_limiters = {
@@ -525,18 +540,26 @@ class PacketProcessor:
         # Check hex/regex pattern
         if rule.get("pattern"):
             try:
-                if rule["pattern"].startswith("\\x"):  # Hex pattern
+                if rule.get('compiled_pattern'): # Use pre-compiled pattern if available
+                    payload_str = payload.decode("utf-8", errors="ignore")
+                    match_results.append(rule['compiled_pattern'].search(payload_str) is not None)
+                elif rule["pattern"].startswith("\\x"):  # Hex pattern
                     hex_pattern = rule["pattern"].replace("\\x", "")
                     hex_bytes = bytes.fromhex(hex_pattern)
                     match_results.append(hex_bytes in payload)
-                else:  # Regex pattern
+                else:
+                    # Fallback for non-hex patterns that were not compiled (e.g. due to error or dynamic rule)
+                    # This part might be skipped if we decide that uncompiled regexes (that are not hex) are invalid.
+                    # For now, keeping a fallback, but logging a warning might be good.
+                    if not rule.get('compiled_pattern') and not rule["pattern"].startswith("\\x"):
+                         logger.warning(f"Regex pattern for rule ID {rule.get('id', 'N/A')} was not pre-compiled. Matching dynamically.")
                     payload_str = payload.decode("utf-8", errors="ignore")
                     match_results.append(
                         re.search(rule["pattern"], payload_str, re.IGNORECASE)
                         is not None
                     )
             except (re.error, ValueError) as e:
-                logger.error(f"Content match error: {e}")
+                logger.error(f"Content match error for rule ID {rule.get('id', 'N/A')}: {e}")
                 match_results.append(False)
 
         # Sequence number analysis (state tracking)
@@ -633,7 +656,15 @@ class PacketProcessor:
         matched_rules = []
 
         # Check against all rules for the packet's protocol
-        protocol_rules = self.rule_manager.get_rules_for_protocol(context.protocol)
+        # Filter rules directly based on context.protocol
+        protocol_to_match = context.protocol.lower() if context.protocol else "any"
+        protocol_rules = [
+            rule
+            for rule in self.rules
+            if rule.get("protocol", "").lower() == protocol_to_match or \
+               rule.get("protocol", "").lower() == "any" or \
+               (protocol_to_match == "any" and not rule.get("protocol")) # Match rules with no protocol if packet protocol is "any" (None)
+        ]
 
         for rule in protocol_rules:
             if self.match_history.should_skip(context.src_ip, rule["id"]):
@@ -646,7 +677,8 @@ class PacketProcessor:
                 continue
             if not self._port_match(rule.get("destination_port"), context.dst_port):
                 continue
-            if not self._content_match(rule.get("pattern"), context.payload):
+            # Pass the whole rule to _content_match, not just the pattern string
+            if not self._content_match(rule, context): # Changed from rule.get("pattern")
                 continue
             if not self._check_threshold(rule, context.src_ip):
                 continue
@@ -2087,20 +2119,21 @@ class IPSWorker(multiprocessing.Process):
         self,
         input_queue: multiprocessing.Queue,
         output_queue: multiprocessing.Queue,
-        rule_file: str,
+        processed_rules: List[Dict], # Changed from rule_file
         worker_id: int,
         threat_intel: ThreatIntel,
     ):
         super().__init__()
         self.input_queue = input_queue
         self.output_queue = output_queue
-        self.rule_file = rule_file
+        self.rules = processed_rules # Store processed rules
         self.threat_intel = threat_intel
         self.worker_id = worker_id
         self.shutdown_flag = multiprocessing.Event()
         self.processed_count = 0
-        self.rule_manager = RuleManager(rule_file, config={"match_ttl": 60})
-        self.packet_processor = PacketProcessor(self.rule_manager, self.threat_intel)
+        # RuleManager is no longer instantiated here
+        # PacketProcessor now takes the list of rules directly
+        self.packet_processor = PacketProcessor(self.rules, self.threat_intel)
 
     def run(self):
         """Main worker process loop"""
@@ -2136,9 +2169,10 @@ class IPSWorker(multiprocessing.Process):
                         )
                         # Potentially increment a counter for dropped output items
 
-                # Periodically reload rules
-                if self.processed_count % 1000 == 0:
-                    self.rule_manager.load_rules()
+                # Periodically reload rules - REMOVED
+                # Rules are now loaded once in the main process and passed to workers.
+                # if self.processed_count % 1000 == 0:
+                #     self.rule_manager.load_rules() # This would cause an error as self.rule_manager is removed
 
             except multiprocessing.TimeoutError:
                 continue
@@ -2267,31 +2301,54 @@ class EnterpriseIPS:
         self.rule_file = rule_file
         self.sio = sio
         self.num_workers = num_workers
-        self.input_queue = input_queue
-        self.threat_intel = threat_intel
-        self.input_queue.maxsize = MAX_PACKET_QUEUE_SIZE
-        self.output_queue = output_queue
+        self.input_queue = input_queue # Should be self.input_queue = input_queue or multiprocessing.Queue()
+        self.threat_intel = threat_intel # Should be self.threat_intel = threat_intel or await ThreatIntel.create()
+
+        # Initialize RuleManager in EnterpriseIPS to load rules once
+        self.main_rule_manager = RuleManager(self.rule_file, config={"match_ttl": 60}) # Assuming config is relevant for main manager
+        self.processed_rules = self.main_rule_manager.rules # Get the list of processed rules
+
+        if self.input_queue is None: # Example initialization if not passed
+            self.input_queue = multiprocessing.Queue(maxsize=MAX_PACKET_QUEUE_SIZE)
+        else:
+            # Ensure maxsize is set if queue is passed externally.
+            # This might be tricky as Queue objects don't expose maxsize easily after creation.
+            # For now, assume it's handled or document that passed queues should be pre-configured.
+            pass
+
+        self.output_queue = output_queue if output_queue is not None else multiprocessing.Queue()
         self.workers = []
         self.stats_collector = StatsCollector()
         self.memory_monitor = MemoryMonitor()
+        mitigation_config = {
+            "firewall_api": settings.FIREWALL_API_URL,
+            "firewall_api_key": settings.FIREWALL_API_KEY,
+            "threat_intel_api": settings.THREAT_INTEL_API_URL,
+            "nac_api": settings.NAC_API_URL, # Corrected typo in original code (local127.0.0.1)
+            "dns_controller_api": settings.DNS_CONTROLLER_API_URL,
+            "dns_controller_key": settings.DNS_CONTROLLER_API_KEY,
+            "geoip_service_url_template": self.config.get("geoip_service_url_template"), # Keep existing way if not in global settings
+            "geoip_service_params": self.config.get("geoip_service_params", {}), # Keep existing way
+            "network_controller_api": self.config.get("network_controller_api"), # Keep existing way
+            "network_controller_key": self.config.get("network_controller_key"), # Keep existing way
+            "network_controller_type": self.config.get("network_controller_type"), # Keep existing way
+            "nac_quarantine_policy": self.config.get("nac_quarantine_policy"), # Keep existing way
+            "dns_sinkhole_ip": self.config.get("dns_sinkhole_ip"), # Keep existing way
+            "cleanup_on_exit": self.config.get("cleanup_on_exit", False), # Keep existing way
+            "default_api_timeout": self.config.get("default_api_timeout", 10), # Keep existing way
+
+            "dashboard_config": {
+                "base_url": settings.DASHBOARD_API_URL,
+                "api_key": settings.DASHBOARD_API_KEY,
+                "max_retries": settings.DASHBOARD_MAX_RETRIES,
+                "retry_delay": settings.DASHBOARD_RETRY_DELAY,
+                "timeout": settings.DASHBOARD_TIMEOUT,
+            },
+        }
         self.mitigation_engine = MitigationEngine(
             sio=sio,
-            threat_intel=self.threat_intel,  # Pass ThreatIntel instance
-            config={
-                "firewall_api": "http://127.0.0.1:8000/firewall",
-                "firewall_api_key": "any-key",
-                "threat_intel_api": "http://127.0.0.1:8000/intel/update",
-                "nac_api": "http://local127.0.0.1/nac/quarantine",
-                "dns_controller_api": "http://127.0.0.1:8000/dns",
-                "dns_controller_key": "test-key",
-                "dashboard_config": {  # Pass dashboard config to MitigationEngine
-                    "base_url": "http://localhost:8081",  # Example: Your SIEM/Dashboard URL
-                    "api_key": "your_dashboard_api_key",
-                    "max_retries": 3,
-                    "retry_delay": 5,  # seconds
-                    "timeout": 10,  # seconds for request timeout
-                },
-            },
+            threat_intel=self.threat_intel,
+            config=mitigation_config,
         )
         self.shutdown_flag = asyncio.Event()
         self.background_tasks = set()
@@ -2305,7 +2362,7 @@ class EnterpriseIPS:
             worker = IPSWorker(
                 input_queue=self.input_queue,
                 output_queue=self.output_queue,
-                rule_file=self.rule_file,
+                processed_rules=self.processed_rules, # Pass processed rules
                 worker_id=i,
                 threat_intel=self.threat_intel,
             )
@@ -2372,11 +2429,14 @@ class EnterpriseIPS:
                 self.stats_collector.update_stats(packet, matches)
 
                 # Create packet context for mitigation
-                processor = PacketProcessor(
-                    RuleManager(self.rule_file, config={"match_ttl": 60}), ThreatIntel()
-                )
-
-                context = processor.create_packet_context(packet)
+                # PacketProcessor needs rules and threat_intel.
+                # We can either create a new PacketProcessor here or use one from a worker (though workers are separate processes).
+                # For creating context, it might be simpler to have a utility or use one from the main_rule_manager's scope if appropriate.
+                # However, PacketProcessor is designed to also process packets, not just create context.
+                # Let's assume we need a PacketProcessor instance here for context creation or other logic.
+                # This PacketProcessor should use the same rules as the workers.
+                temp_processor = PacketProcessor(self.processed_rules, self.threat_intel)
+                context = temp_processor.create_packet_context(packet)
 
                 # Execute mitigation for each match
                 for match in matches:
@@ -2418,6 +2478,7 @@ class EnterpriseIPS:
                     output_queue=self.output_queue,
                     rule_file=self.rule_file,
                     worker_id=worker.worker_id,
+                    processed_rules=self.processed_rules, # Pass processed rules to new worker
                     threat_intel=self.threat_intel,
                 )
                 new_worker.start()
